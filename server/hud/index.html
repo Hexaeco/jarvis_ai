@@ -303,6 +303,10 @@ footer{
       <div class="kv"><span>Turns today (HUD)</span><b id="uTurns">—</b></div>
       <div class="kv"><span>11Labs quota</span><b id="uTts">—</b></div>
       <div class="bar"><i id="ttsBar"></i></div>
+      <div style="border-top:1px solid var(--line); margin:6px 0 4px"></div>
+      <div class="kv"><span>DeepSeek balance</span><b id="balDeepseek">—</b></div>
+      <div class="kv"><span>GLM/Z.AI balance</span><b id="balGlm">N/A (no official API found)</b></div>
+      <div class="kv"><span>Economy Guard (ALIAS)</span><b id="balEconomy">blocked (dashboard session auth)</b></div>
     </div>
     <div class="panel"><h2><span>MACHINES</span><span class="num">07</span></h2>
       <div id="machinesList"><div class="kv"><span>loading…</span></div></div>
@@ -714,6 +718,12 @@ async function refreshModelsLoadout(){
     $("mdlStt").textContent="?"; $("mdlTts").textContent="?"; $("mdlFallback").textContent="?";
   }
 }
+async function refreshProviderBalances(){
+  try{
+    const r=await fetch("/api/provider-balances"); const j=await r.json();
+    if(j.deepseek){ $("balDeepseek").textContent=j.deepseek.balance+" "+j.deepseek.currency; } else { $("balDeepseek").textContent="unavailable"; }
+  }catch{ $("balDeepseek").textContent="?"; }
+}
 async function refreshUsage(){
   try{
     const r=await fetch("/api/usage"); const j=await r.json();
@@ -734,7 +744,7 @@ async function refreshUsage(){
     }
   }catch{}
 }
-refreshHealth();refreshSkills();refreshJobs();refreshMachines();refreshUsage();refreshModelsLoadout();
+refreshHealth();refreshSkills();refreshJobs();refreshMachines();refreshUsage();refreshModelsLoadout();refreshProviderBalances();
 setInterval(refreshUsage,60000);
 setInterval(refreshHealth,15000); setInterval(refreshJobs,60000); setInterval(refreshMachines,10000);
 setInterval(refreshSkills,120000);
