@@ -121,15 +121,23 @@ def load_config() -> dict:
 class TurnTiming:
     turn_id: int
     audio_start_monotonic: float | None = None
-    end_of_speech_monotonic: float | None = None
+    # GO LATENCE (correction Master) : 8 frontieres exactes, mesurees reellement
+    # (pas approximees), un seul domaine d'horloge (time.perf_counter() cote
+    # serveur -- browser_first_audio_monotonic est l'heure serveur de RECEPTION
+    # de l'accuse client, pas l'horloge navigateur : biais = ~1/2 aller-retour
+    # WS, quelques ms typiquement, signale explicitement dans le rapport).
+    end_of_speech_monotonic: float | None = None       # 1. speech_end (VAD reel, callback on_recording_stop)
     stt_start_monotonic: float | None = None
-    stt_final_monotonic: float | None = None
+    stt_final_monotonic: float | None = None            # 2. transcript_ready (retour reel de .text())
+    hermes_request_sent_monotonic: float | None = None  # 3. hermes_request_sent (juste avant requests.post)
+    first_sse_byte_monotonic: float | None = None       # 4. first_SSE_byte (1ere ligne brute recue, avant parsing)
     llm_start_monotonic: float | None = None
-    llm_first_token_monotonic: float | None = None
+    llm_first_token_monotonic: float | None = None      # 5. first_LLM_token (1er evenement assistant.delta)
     llm_full_response_monotonic: float | None = None
-    first_sentence_monotonic: float | None = None
+    first_sentence_monotonic: float | None = None        # 6. first_sentence_ready (1ere phrase decoupee, prete a synthetiser)
     tts_request_start_monotonic: float | None = None
-    first_tts_audio_byte_monotonic: float | None = None
+    first_tts_audio_byte_monotonic: float | None = None  # 7. TTS_first_chunk (1er octet PCM du process ffmpeg)
+    browser_first_audio_monotonic: float | None = None    # 8. browser_first_audio (accuse client, voir note horloge)
     total_done_monotonic: float | None = None
     transcript: str = ""
     response_text: str = ""
@@ -159,17 +167,20 @@ class TurnTiming:
             "run_id": self.run_id,
             "interrupted": self.interrupted,
             "tools_used": self.tools_used,
-            # full breakdown, speech-end -> first audio byte in the browser (GO LATENCE)
-            "speech_end_to_transcript_seconds": self._delta(eos, self.stt_final_monotonic),
-            "transcript_to_llm_submit_seconds": self._delta(self.stt_final_monotonic, self.llm_start_monotonic),
-            "llm_time_to_first_token_seconds": self._delta(self.llm_start_monotonic, self.llm_first_token_monotonic),
-            "llm_first_token_to_full_response_seconds": self._delta(self.llm_first_token_monotonic, self.llm_full_response_monotonic),
-            "full_response_to_tts_start_seconds": self._delta(self.llm_full_response_monotonic, self.tts_request_start_monotonic),
-            "time_to_first_tts_audio_byte_seconds": self._delta(self.tts_request_start_monotonic, self.first_tts_audio_byte_monotonic),
-            "end_of_speech_to_first_audio_seconds": self._delta(eos, self.first_tts_audio_byte_monotonic),
+            # 8 frontieres exactes (GO LATENCE) -- chaque valeur est un delta reel
+            # entre deux horodatages mesures individuellement, aucune approximation.
+            "speech_end_to_transcript_ready_seconds": self._delta(eos, self.stt_final_monotonic),
+            "transcript_ready_to_hermes_request_sent_seconds": self._delta(self.stt_final_monotonic, self.hermes_request_sent_monotonic),
+            "hermes_request_sent_to_first_sse_byte_seconds": self._delta(self.hermes_request_sent_monotonic, self.first_sse_byte_monotonic),
+            "first_sse_byte_to_first_llm_token_seconds": self._delta(self.first_sse_byte_monotonic, self.llm_first_token_monotonic),
+            "first_llm_token_to_first_sentence_ready_seconds": self._delta(self.llm_first_token_monotonic, self.first_sentence_monotonic),
+            "first_sentence_ready_to_tts_first_chunk_seconds": self._delta(self.first_sentence_monotonic, self.first_tts_audio_byte_monotonic),
+            "tts_first_chunk_to_browser_first_audio_seconds": self._delta(self.first_tts_audio_byte_monotonic, self.browser_first_audio_monotonic),
+            "speech_end_to_browser_first_audio_seconds": self._delta(eos, self.browser_first_audio_monotonic),
             "total_turn_seconds": self._delta(eos, self.total_done_monotonic),
             # kept for backward compat with existing HUD panel
             "stt_finalize_seconds": self._delta(self.stt_start_monotonic, self.stt_final_monotonic),
+            "end_of_speech_to_first_audio_seconds": self._delta(eos, self.first_tts_audio_byte_monotonic),
             "errors": self.errors,
         }
 
@@ -237,8 +248,12 @@ class HermesAPI:
                           json=body, timeout=15)
         return {"status_code": r.status_code, "body": r.text[:300]}
 
-    def chat_stream_events(self, session_id: str, input_text: str, timeout: float) -> Iterator[tuple[str, str]]:
+    def chat_stream_events(
+        self, session_id: str, input_text: str, timeout: float, timing: "TurnTiming | None" = None,
+    ) -> Iterator[tuple[str, str]]:
         """Yield ("run"|"text"|"tool"|"approval"|"final", value) from a session turn."""
+        if timing is not None:
+            timing.hermes_request_sent_monotonic = time.perf_counter()  # GO LATENCE: frontiere 3
         resp = requests.post(
             f"{self.base}/api/sessions/{session_id}/chat/stream",
             headers={**self.headers(), "Accept": "text/event-stream"},
@@ -249,14 +264,16 @@ class HermesAPI:
             raise RuntimeError(f"Hermes session chat HTTP {resp.status_code}: {resp.text[:300]}")
         resp.encoding = "utf-8"  # SSE has no charset header; requests would assume latin-1 (mojibake)
         try:
-            yield from self._parse_sse(resp)
+            yield from self._parse_sse(resp, timing)
         finally:
             resp.close()  # leaked FDs killed the server once (launchd limit is tiny)
 
     @staticmethod
-    def _parse_sse(resp) -> Iterator[tuple[str, str]]:
+    def _parse_sse(resp, timing: "TurnTiming | None" = None) -> Iterator[tuple[str, str]]:
         event_name = ""
         for raw in resp.iter_lines(decode_unicode=True):
+            if timing is not None and timing.first_sse_byte_monotonic is None:
+                timing.first_sse_byte_monotonic = time.perf_counter()  # GO LATENCE: frontiere 4 (1ere ligne brute, avant parsing)
             if raw is None:
                 continue
             if raw.startswith("event: "):
@@ -333,6 +350,17 @@ class VoicePipelineServer:
         self.turn_counter = 0
         self.hermes = HermesAPI(cfg)
         self.stt_lock = asyncio.Lock()
+        # GO LATENCE (correction Master) : frontiere 1 (speech_end) mesuree pour de
+        # vrai via le callback natif on_recording_stop de RealtimeSTT (fire quand son
+        # propre VAD detecte la fin de parole), au lieu d'approximer avec l'heure de
+        # retour de .text() (qui inclut deja la transcription). Callback synchrone,
+        # thread interne RealtimeSTT -- simple ecriture d'un flottant, pas de lock
+        # necessaire (mode continu = un seul tour traite a la fois).
+        self._speech_end_monotonic: float | None = None
+
+        def _on_recording_stop() -> None:
+            self._speech_end_monotonic = time.perf_counter()
+
         self.recorder = AudioToTextRecorder(
             model=cfg["stt"]["model"],
             use_microphone=False,
@@ -348,6 +376,7 @@ class VoicePipelineServer:
             # mode continu (.text()). N'affecte pas l'ancien flux push-to-talk qui
             # passe toujours son propre buffer explicite a perform_final_transcription.
             post_speech_silence_duration=0.7,
+            on_recording_stop=_on_recording_stop,
         )
         # RealtimeTTS (Edge) -- remplace le pont docker-exec par phrase : moteur
         # persistant reutilise pour toutes les phrases/tours (evite de reinitialiser
@@ -464,7 +493,7 @@ class VoicePipelineServer:
         timing.llm_model = "hermes-agent"
         timeout = float(h.get("timeout", 240))
         try:
-            it = self.hermes.chat_stream_events(session_id, transcript, timeout)
+            it = self.hermes.chat_stream_events(session_id, transcript, timeout, timing)
             for kind, value in it:
                 if kind == "text" and timing.llm_first_token_monotonic is None:
                     timing.llm_first_token_monotonic = time.perf_counter()
@@ -473,7 +502,7 @@ class VoicePipelineServer:
             # stale session id (e.g. Hermes DB reset) -> recreate once
             if "404" in str(exc):
                 session_id = self.hermes.get_session_id(conversation, force_new=True)
-                for kind, value in self.hermes.chat_stream_events(session_id, transcript, timeout):
+                for kind, value in self.hermes.chat_stream_events(session_id, transcript, timeout, timing):
                     if kind == "text" and timing.llm_first_token_monotonic is None:
                         timing.llm_first_token_monotonic = time.perf_counter()
                     yield (kind, value)
@@ -1215,6 +1244,9 @@ class ConnState:
     # (recording/audio_chunks ci-dessus), inchange.
     voice_mode: bool = False
     voice_mode_task: asyncio.Task | None = None
+    # GO LATENCE : timings en attente d'accuse navigateur (frontiere 8), voir
+    # _voice_mode_loop et le handler "client_first_audio".
+    pending_acks: dict = field(default_factory=dict)
 
 
 async def _voice_mode_loop(ws: WebSocket, pipeline: VoicePipelineServer, conn: ConnState) -> None:
@@ -1227,22 +1259,32 @@ async def _voice_mode_loop(ws: WebSocket, pipeline: VoicePipelineServer, conn: C
     await ws.send_json({"type": "voice_mode_status", "state": "listening"})
     try:
         while conn.voice_mode:
+            pipeline._speech_end_monotonic = None  # arme avant l'ecoute (GO LATENCE frontiere 1)
             transcript = await asyncio.to_thread(pipeline.recorder.text)
+            t_transcript_ready = time.perf_counter()  # frontiere 2 : .text() vient de retourner, pour de vrai
             if not conn.voice_mode:
                 break
             transcript = (transcript or "").strip()
             if not transcript:
                 continue
             timing = TurnTiming(turn_id=pipeline.next_turn_id())
-            timing.end_of_speech_monotonic = time.perf_counter()
+            # callback on_recording_stop tire avant le retour de .text() ; si absent
+            # (edge case), repli sur l'heure de retour plutot que planter.
+            timing.end_of_speech_monotonic = pipeline._speech_end_monotonic or t_transcript_ready
             timing.stt_start_monotonic = timing.end_of_speech_monotonic
-            timing.stt_final_monotonic = timing.end_of_speech_monotonic
+            timing.stt_final_monotonic = t_transcript_ready
             timing.stt_model = CFG["stt"]["model"]
             timing.transcript = transcript
             timing.detected_language = getattr(pipeline.recorder, "detected_language", None) or ""
             conn.timing = timing
             conn.current_run_id = None
-            await ws.send_json({"type": "transcript", "text": transcript})
+            # accuse de reception navigateur (frontiere 8) : conserve le timing accessible
+            # par turn_id le temps que le client confirme le premier audio joue, meme si
+            # "done" est deja parti et conn.timing a change de tour.
+            conn.pending_acks[timing.turn_id] = timing
+            while len(conn.pending_acks) > 5:
+                conn.pending_acks.pop(next(iter(conn.pending_acks)))
+            await ws.send_json({"type": "transcript", "text": transcript, "turn_id": timing.turn_id})
             try:
                 await pipeline.stream_response_audio(ws, transcript, timing, conn)
                 timing.total_done_monotonic = time.perf_counter()
@@ -1391,6 +1433,16 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                         conn.voice_mode_task = asyncio.create_task(_voice_mode_loop(ws, pipeline, conn))
                 elif etype == "voice_mode_stop":
                     conn.voice_mode = False
+                elif etype == "client_first_audio":
+                    # GO LATENCE : frontiere 8, accuse navigateur. Horodatage pris a
+                    # la RECEPTION cote serveur (meme domaine d'horloge que tout le
+                    # reste) -- biais = ~1/2 aller-retour WS, negligeable et signale.
+                    t_ack = time.perf_counter()
+                    ack_turn_id = event.get("turn_id")
+                    t = conn.pending_acks.pop(ack_turn_id, None)
+                    if t is not None and t.browser_first_audio_monotonic is None:
+                        t.browser_first_audio_monotonic = t_ack
+                        pipeline.log_turn(t)
                 elif etype == "approval_decision":
                     run_id = event.get("run_id") or conn.current_run_id
                     if not run_id:
