@@ -925,7 +925,8 @@ async def hud_config() -> JSONResponse:
     # config reelle plutot que de le coder en dur cote client (bug reel trouve : le JS visait
     # :9443 alors que server.yaml configure 29443, fenetres VIEWS systematiquement vides).
     port = ((CFG.get("server") or {}).get("dashboard_proxy") or {}).get("port")
-    return JSONResponse({"dashboard_proxy_port": port})
+    files_port = ((CFG.get("server") or {}).get("files_proxy") or {}).get("port")
+    return JSONResponse({"dashboard_proxy_port": port, "files_proxy_port": files_port})
 
 
 @app.get("/api/models-loadout")
@@ -1101,6 +1102,43 @@ async def dash_http_proxy(path: str, request: Request) -> Response:
     def do_request() -> requests.Response:
         return requests.request(
             request.method, f"{_dash_target()}/{path}",
+            params=dict(request.query_params), headers=fwd_headers,
+            data=body if body else None, timeout=60, allow_redirects=False,
+        )
+
+    resp = await asyncio.to_thread(do_request)
+    out_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _STRIP_HEADERS}
+    return Response(content=resp.content, status_code=resp.status_code, headers=out_headers)
+
+
+# ----------------------------------------------- FileBrowser TLS proxy
+# Correction Master (FILES) : meme probleme mixed-content que le dashboard Hermes -- FileBrowser
+# Quantum n'a pas de TLS natif. Reutilise EXACTEMENT le meme patron que dash_app ci-dessus (auth
+# middleware partagee, memes en-tetes strippes) plutot qu'un nouveau mecanisme.
+files_app = FastAPI(title="FileBrowser TLS Proxy")
+
+
+@files_app.middleware("http")
+async def files_auth_middleware(request: Request, call_next):
+    if not _request_authed(request):
+        return Response(status_code=401, content="jarvis auth required")
+    return await call_next(request)
+
+
+def _files_target() -> str:
+    return ((CFG.get("server") or {}).get("files_proxy") or {}).get(
+        "target", "http://127.0.0.1:28090").rstrip("/")
+
+
+@files_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def files_http_proxy(path: str, request: Request) -> Response:
+    body = await request.body()
+    fwd_headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in ("host", "accept-encoding", "connection")}
+
+    def do_request() -> requests.Response:
+        return requests.request(
+            request.method, f"{_files_target()}/{path}",
             params=dict(request.query_params), headers=fwd_headers,
             data=body if body else None, timeout=60, allow_redirects=False,
         )
@@ -1300,6 +1338,14 @@ def main() -> int:
             print(f"Dashboard proxy on https://{host}:{dp['port']}/", flush=True)
             servers.append(uvicorn.Server(uvicorn.Config(
                 dash_app, host=host, port=int(dp["port"]), log_level="warning",
+                ssl_certfile=str(ROOT / cert), ssl_keyfile=str(ROOT / key),
+            )))
+
+        fp = server.get("files_proxy") or {}
+        if fp.get("port"):
+            print(f"Files proxy on https://{host}:{fp['port']}/", flush=True)
+            servers.append(uvicorn.Server(uvicorn.Config(
+                files_app, host=host, port=int(fp["port"]), log_level="warning",
                 ssl_certfile=str(ROOT / cert), ssl_keyfile=str(ROOT / key),
             )))
 
