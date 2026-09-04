@@ -125,12 +125,14 @@ class TurnTiming:
     stt_final_monotonic: float | None = None
     llm_start_monotonic: float | None = None
     llm_first_token_monotonic: float | None = None
+    llm_full_response_monotonic: float | None = None
     first_sentence_monotonic: float | None = None
     tts_request_start_monotonic: float | None = None
     first_tts_audio_byte_monotonic: float | None = None
     total_done_monotonic: float | None = None
     transcript: str = ""
     response_text: str = ""
+    detected_language: str = ""
     stt_model: str = ""
     llm_provider: str = ""
     llm_model: str = ""
@@ -147,6 +149,7 @@ class TurnTiming:
             "turn_id": self.turn_id,
             "transcript": self.transcript,
             "response_text": self.response_text,
+            "detected_language": self.detected_language,
             "stt_model": self.stt_model,
             "llm_provider": self.llm_provider,
             "llm_model": self.llm_model,
@@ -155,11 +158,17 @@ class TurnTiming:
             "run_id": self.run_id,
             "interrupted": self.interrupted,
             "tools_used": self.tools_used,
-            "stt_finalize_seconds": self._delta(self.stt_start_monotonic, self.stt_final_monotonic),
+            # full breakdown, speech-end -> first audio byte in the browser (GO LATENCE)
+            "speech_end_to_transcript_seconds": self._delta(eos, self.stt_final_monotonic),
+            "transcript_to_llm_submit_seconds": self._delta(self.stt_final_monotonic, self.llm_start_monotonic),
             "llm_time_to_first_token_seconds": self._delta(self.llm_start_monotonic, self.llm_first_token_monotonic),
+            "llm_first_token_to_full_response_seconds": self._delta(self.llm_first_token_monotonic, self.llm_full_response_monotonic),
+            "full_response_to_tts_start_seconds": self._delta(self.llm_full_response_monotonic, self.tts_request_start_monotonic),
             "time_to_first_tts_audio_byte_seconds": self._delta(self.tts_request_start_monotonic, self.first_tts_audio_byte_monotonic),
             "end_of_speech_to_first_audio_seconds": self._delta(eos, self.first_tts_audio_byte_monotonic),
             "total_turn_seconds": self._delta(eos, self.total_done_monotonic),
+            # kept for backward compat with existing HUD panel
+            "stt_finalize_seconds": self._delta(self.stt_start_monotonic, self.stt_final_monotonic),
             "errors": self.errors,
         }
 
@@ -304,12 +313,38 @@ class HermesAPI:
 # MP3 resultant en PCM16 16kHz mono (deja le format attendu par playChunk() du
 # HUD) via ffmpeg (deja present dans le conteneur), puis supprime le fichier
 # audio temporaire -- aucun fichier audio public, transport interne uniquement.
+# GO LANGUE (correction Master) : la voix Edge par defaut (DEFAULT_EDGE_VOICE
+# dans tools/tts_tool.py) est en-US-AriaNeural -- fixe, anglaise, quelle que
+# soit la langue parlee/repondue. Le point d'entree public text_to_speech_tool
+# ne permet PAS de choisir la voix par appel ("Voice ... user-configured, not
+# model-selected", d'apres son propre docstring) ; on appelle donc la fonction
+# interne _text_to_speech_single (meme module Hermes, meme moteur Edge, aucun
+# nouveau TTS) avec tts_config_override pour selectionner une voix native Edge
+# correspondant a la langue detectee par le STT. Voix verifiees reellement
+# disponibles via edge_tts.list_voices() avant de coder ce mapping.
+_ALIAS_TTS_VOICE_BY_LANG = {
+    "en": "en-US-AriaNeural",
+    "fr": "fr-FR-DeniseNeural",
+    "es": "es-ES-ElviraNeural",
+    "de": "de-DE-KatjaNeural",
+    "it": "it-IT-ElsaNeural",
+    "pt": "pt-BR-FranciscaNeural",
+    "nl": "nl-NL-ColetteNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "ru": "ru-RU-SvetlanaNeural",
+    "ar": "ar-SA-ZariyahNeural",
+}
+
 _HERMES_TTS_BRIDGE_SCRIPT = """
 import sys, os, json, base64, subprocess
 sys.path.insert(0, "/opt/hermes")
 text = base64.b64decode(os.environ["ALIAS_TTS_TEXT_B64"]).decode("utf-8")
-from tools.tts_tool import text_to_speech_tool
-result = json.loads(text_to_speech_tool(text=text, provider="edge"))
+voice = os.environ.get("ALIAS_TTS_VOICE") or "en-US-AriaNeural"
+from tools.tts_tool import _text_to_speech_single
+result = json.loads(_text_to_speech_single(
+    text=text, provider="edge", tts_config_override={"edge": {"voice": voice}},
+))
 if not result.get("success"):
     sys.stderr.write(json.dumps(result))
     sys.exit(1)
@@ -344,7 +379,7 @@ class VoicePipelineServer:
             device=cfg["stt"].get("device", "cpu"),
             compute_type=cfg["stt"].get("compute_type", "int8"),
             sample_rate=int(cfg["stt"].get("sample_rate", 16000)),
-            language="en",
+            language="",  # "" = faster-whisper auto-detects the spoken language (FR/EN/etc)
             beam_size=1,
             faster_whisper_vad_filter=False,
             no_log_file=True,
@@ -374,6 +409,10 @@ class VoicePipelineServer:
                 self.recorder.feed_audio(samples, original_sample_rate=sample_rate)
                 text = await asyncio.to_thread(self.recorder.perform_final_transcription, samples, True)
                 self.recorder.clear_audio_queue()
+            if timing:
+                # set by RealtimeSTT as a side effect of perform_final_transcription
+                # (native auto-detection -- GO LANGUE, no new engine)
+                timing.detected_language = getattr(self.recorder, "detected_language", None) or ""
         except Exception as exc:
             # near-silent audio can make whisper raise ("No clip timestamps found");
             # treat as empty transcript instead of failing the turn
@@ -475,15 +514,19 @@ class VoicePipelineServer:
     def tts_chunks_sync(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
         """Bridge minimal vers le TTS natif Hermes (Edge TTS, keyless) --
         aucun nouveau provider, aucune reimplementation : appelle le meme
-        tools.tts_tool.text_to_speech_tool que l'agent Hermes utilise deja."""
+        moteur Edge que l'agent Hermes utilise deja, avec une voix choisie
+        selon la langue detectee par le STT (GO LANGUE)."""
+        lang = (timing.detected_language or "en").split("-")[0].lower()
+        voice = _ALIAS_TTS_VOICE_BY_LANG.get(lang, _ALIAS_TTS_VOICE_BY_LANG["en"])
         timing.tts_model = "hermes-edge"
-        timing.voice_id = "edge-default"
+        timing.voice_id = voice
         timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
         record_usage(tts_chars=len(text))
         text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
         proc = subprocess.run(
             ["docker", "exec", "-i",
              "-e", f"ALIAS_TTS_TEXT_B64={text_b64}",
+             "-e", f"ALIAS_TTS_VOICE={voice}",
              "alias-hermes", "/opt/hermes/.venv/bin/python3", "-"],
             input=_HERMES_TTS_BRIDGE_SCRIPT.encode("utf-8"),
             capture_output=True, timeout=60,
@@ -524,6 +567,7 @@ class VoicePipelineServer:
             while True:
                 item = await q.get()
                 if item is None:
+                    timing.llm_full_response_monotonic = time.perf_counter()  # GO LATENCE
                     break
                 if isinstance(item, Exception):
                     raise item
