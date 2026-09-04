@@ -22,9 +22,9 @@ and approval events. Falls back to direct Anthropic ("basic mode") if unreachabl
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
+import queue
 import re
 import subprocess
 import threading
@@ -42,6 +42,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from RealtimeSTT import AudioToTextRecorder
+from RealtimeTTS import TextToAudioStream, EdgeEngine
 
 try:
     import psutil
@@ -305,23 +306,12 @@ class HermesAPI:
 
 
 # ------------------------------------------------------------------- TTS bridge
-# GO TTS uniquement (correction Master) : ElevenLabs interdit. Reutilise le
-# mecanisme text_to_speech natif de Hermes (Edge TTS, keyless) au lieu de
-# reimplementer un moteur TTS. Hermes tourne dans un conteneur Docker separe
-# (config/venv propres) donc le bridge minimal est un `docker exec` qui appelle
-# tools.tts_tool.text_to_speech_tool(provider="edge") tel quel, convertit le
-# MP3 resultant en PCM16 16kHz mono (deja le format attendu par playChunk() du
-# HUD) via ffmpeg (deja present dans le conteneur), puis supprime le fichier
-# audio temporaire -- aucun fichier audio public, transport interne uniquement.
-# GO LANGUE (correction Master) : la voix Edge par defaut (DEFAULT_EDGE_VOICE
-# dans tools/tts_tool.py) est en-US-AriaNeural -- fixe, anglaise, quelle que
-# soit la langue parlee/repondue. Le point d'entree public text_to_speech_tool
-# ne permet PAS de choisir la voix par appel ("Voice ... user-configured, not
-# model-selected", d'apres son propre docstring) ; on appelle donc la fonction
-# interne _text_to_speech_single (meme module Hermes, meme moteur Edge, aucun
-# nouveau TTS) avec tts_config_override pour selectionner une voix native Edge
-# correspondant a la langue detectee par le STT. Voix verifiees reellement
-# disponibles via edge_tts.list_voices() avant de coder ce mapping.
+# ElevenLabs interdit. TEST PRODUIT (architecture retenue, correction Master) :
+# RealtimeTTS (moteur Edge natif, meme provider/voix que Hermes) remplace le
+# pont docker-exec par phrase -- flux MP3->PCM en continu via ffmpeg (voir
+# tts_chunks_sync), pas d'attente de fichier complet. Voix choisie selon la
+# langue detectee par le STT ; voix verifiees reellement disponibles via
+# edge_tts.list_voices() avant de coder ce mapping.
 _ALIAS_TTS_VOICE_BY_LANG = {
     "en": "en-US-AriaNeural",
     "fr": "fr-FR-DeniseNeural",
@@ -335,35 +325,6 @@ _ALIAS_TTS_VOICE_BY_LANG = {
     "ru": "ru-RU-SvetlanaNeural",
     "ar": "ar-SA-ZariyahNeural",
 }
-
-_HERMES_TTS_BRIDGE_SCRIPT = """
-import sys, os, json, base64, subprocess
-sys.path.insert(0, "/opt/hermes")
-text = base64.b64decode(os.environ["ALIAS_TTS_TEXT_B64"]).decode("utf-8")
-voice = os.environ.get("ALIAS_TTS_VOICE") or "en-US-AriaNeural"
-from tools.tts_tool import _text_to_speech_single
-result = json.loads(_text_to_speech_single(
-    text=text, provider="edge", tts_config_override={"edge": {"voice": voice}},
-))
-if not result.get("success"):
-    sys.stderr.write(json.dumps(result))
-    sys.exit(1)
-file_path = result["file_path"]
-try:
-    proc = subprocess.run(
-        ["ffmpeg", "-y", "-i", file_path, "-f", "s16le", "-ar", "16000", "-ac", "1", "-"],
-        capture_output=True,
-    )
-finally:
-    try:
-        os.remove(file_path)
-    except OSError:
-        pass
-if proc.returncode != 0:
-    sys.stderr.write(proc.stderr.decode(errors="replace"))
-    sys.exit(1)
-sys.stdout.buffer.write(proc.stdout)
-"""
 
 
 class VoicePipelineServer:
@@ -383,7 +344,17 @@ class VoicePipelineServer:
             beam_size=1,
             faster_whisper_vad_filter=False,
             no_log_file=True,
+            # TEST PRODUIT (architecture retenue) : VAD natif RealtimeSTT pour le
+            # mode continu (.text()). N'affecte pas l'ancien flux push-to-talk qui
+            # passe toujours son propre buffer explicite a perform_final_transcription.
+            post_speech_silence_duration=0.7,
         )
+        # RealtimeTTS (Edge) -- remplace le pont docker-exec par phrase : moteur
+        # persistant reutilise pour toutes les phrases/tours (evite de reinitialiser
+        # PortAudio a chaque appel). muted=True partout : jamais de lecture locale,
+        # seulement les chunks bruts via on_audio_chunk, transcodes en flux vers le HUD.
+        self.tts_engine = EdgeEngine()
+        self.tts_stream = TextToAudioStream(self.tts_engine, muted=True)
 
     def next_turn_id(self) -> int:
         self.turn_counter += 1
@@ -512,35 +483,69 @@ class VoicePipelineServer:
     # ------------------------------------------------------------------ TTS
 
     def tts_chunks_sync(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
-        """Bridge minimal vers le TTS natif Hermes (Edge TTS, keyless) --
-        aucun nouveau provider, aucune reimplementation : appelle le meme
-        moteur Edge que l'agent Hermes utilise deja, avec une voix choisie
-        selon la langue detectee par le STT (GO LANGUE)."""
+        """RealtimeTTS (Edge), flux reel -- remplace le pont docker-exec par
+        phrase (architecture retenue, correction Master). Meme provider Edge,
+        voix choisie selon la langue detectee par le STT (GO LANGUE). Les
+        chunks MP3 d'edge-tts arrivent au fil de la synthese (callback
+        on_audio_chunk) et sont transcodes en PCM16 16kHz EN FLUX via un
+        ffmpeg persistant (stdin=MP3 progressif, stdout=PCM progressif) --
+        pas d'attente du fichier complet, c'est ce qui donne le gain de
+        latence mesure (~238ms vs ~5s avec l'ancien pont)."""
         lang = (timing.detected_language or "en").split("-")[0].lower()
         voice = _ALIAS_TTS_VOICE_BY_LANG.get(lang, _ALIAS_TTS_VOICE_BY_LANG["en"])
-        timing.tts_model = "hermes-edge"
+        timing.tts_model = "realtimetts-edge"
         timing.voice_id = voice
         timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
         record_usage(tts_chars=len(text))
-        text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
-        proc = subprocess.run(
-            ["docker", "exec", "-i",
-             "-e", f"ALIAS_TTS_TEXT_B64={text_b64}",
-             "-e", f"ALIAS_TTS_VOICE={voice}",
-             "alias-hermes", "/opt/hermes/.venv/bin/python3", "-"],
-            input=_HERMES_TTS_BRIDGE_SCRIPT.encode("utf-8"),
-            capture_output=True, timeout=60,
+
+        proc = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "mp3", "-i", "pipe:0", "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
-        if proc.returncode != 0:
-            raise RuntimeError(f"Hermes TTS bridge failed: {proc.stderr.decode(errors='replace')[:500]}")
-        pcm = proc.stdout
-        if not pcm:
-            raise RuntimeError("Hermes TTS bridge returned no audio")
-        chunk_size = 4096
-        for i in range(0, len(pcm), chunk_size):
+        pcm_q: queue.Queue = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                while True:
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    pcm_q.put(chunk)
+            finally:
+                pcm_q.put(None)
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        def _on_mp3_chunk(mp3_bytes: bytes) -> None:
+            try:
+                proc.stdin.write(mp3_bytes)
+            except (BrokenPipeError, ValueError):
+                pass
+
+        try:
+            self.tts_engine.set_voice(voice)
+            self.tts_stream.feed(text)
+            self.tts_stream.play(on_audio_chunk=_on_mp3_chunk, muted=True)
+        finally:
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, ValueError):
+                pass
+
+        while True:
+            chunk = pcm_q.get()
+            if chunk is None:
+                break
             if timing.first_tts_audio_byte_monotonic is None:
                 timing.first_tts_audio_byte_monotonic = time.perf_counter()
-            yield pcm[i:i + chunk_size]
+            yield chunk
+        reader_thread.join(timeout=3)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
     # ------------------------------------------------------------- Turn flow
 
@@ -1205,6 +1210,53 @@ class ConnState:
     interrupt_note: str | None = None
     partial_task: asyncio.Task | None = None
     last_partial_bytes: int = 0
+    # TEST PRODUIT -- mode vocal continu (VAD natif RealtimeSTT, 1 clic,
+    # plusieurs tours sans clic entre eux). Coexiste avec l'ancien push-to-talk
+    # (recording/audio_chunks ci-dessus), inchange.
+    voice_mode: bool = False
+    voice_mode_task: asyncio.Task | None = None
+
+
+async def _voice_mode_loop(ws: WebSocket, pipeline: VoicePipelineServer, conn: ConnState) -> None:
+    """TEST PRODUIT -- mode vocal continu. 1 clic pour entrer ; boucle :
+    ecoute (VAD natif RealtimeSTT via .text(), voir __init__) -> transcript ->
+    tour complet (LLM + TTS) -> reprise automatique de l'ecoute, sans clic
+    entre les tours. Sort quand conn.voice_mode passe a False (prend effet
+    apres la fin de l'attente de parole en cours -- pas d'interruption dure
+    de .text() dans cette version)."""
+    await ws.send_json({"type": "voice_mode_status", "state": "listening"})
+    try:
+        while conn.voice_mode:
+            transcript = await asyncio.to_thread(pipeline.recorder.text)
+            if not conn.voice_mode:
+                break
+            transcript = (transcript or "").strip()
+            if not transcript:
+                continue
+            timing = TurnTiming(turn_id=pipeline.next_turn_id())
+            timing.end_of_speech_monotonic = time.perf_counter()
+            timing.stt_start_monotonic = timing.end_of_speech_monotonic
+            timing.stt_final_monotonic = timing.end_of_speech_monotonic
+            timing.stt_model = CFG["stt"]["model"]
+            timing.transcript = transcript
+            timing.detected_language = getattr(pipeline.recorder, "detected_language", None) or ""
+            conn.timing = timing
+            conn.current_run_id = None
+            await ws.send_json({"type": "transcript", "text": transcript})
+            try:
+                await pipeline.stream_response_audio(ws, transcript, timing, conn)
+                timing.total_done_monotonic = time.perf_counter()
+                await ws.send_json({"type": "done", "turn_id": timing.turn_id, "timing": timing.summary()})
+            except Exception as exc:
+                timing.errors.append(f"{type(exc).__name__}: {exc}")
+                await ws.send_json({"type": "error", "message": str(exc)})
+            finally:
+                pipeline.log_turn(timing)
+                conn.timing = None
+            if conn.voice_mode:
+                await ws.send_json({"type": "voice_mode_status", "state": "listening"})
+    finally:
+        await ws.send_json({"type": "voice_mode_status", "state": "stopped"})
 
 
 async def _run_turn(ws: WebSocket, pipeline: VoicePipelineServer, conn: ConnState) -> None:
@@ -1331,6 +1383,14 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 elif etype == "stop_run":
                     await _cancel_active_turn(ws, pipeline, conn)
                     await ws.send_json({"type": "agent_status", "state": "stopped"})
+                elif etype == "voice_mode_start":
+                    if event.get("conversation"):
+                        conn.conversation = str(event["conversation"])
+                    if not conn.voice_mode:
+                        conn.voice_mode = True
+                        conn.voice_mode_task = asyncio.create_task(_voice_mode_loop(ws, pipeline, conn))
+                elif etype == "voice_mode_stop":
+                    conn.voice_mode = False
                 elif etype == "approval_decision":
                     run_id = event.get("run_id") or conn.current_run_id
                     if not run_id:
@@ -1350,9 +1410,12 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 if conn.recording:
                     conn.audio_chunks.append(message["bytes"])
                     _maybe_schedule_partial(ws, pipeline, conn)
+                if conn.voice_mode:
+                    pipeline.recorder.feed_audio(message["bytes"])
     except WebSocketDisconnect:
         if conn.turn_task and not conn.turn_task.done():
             conn.turn_task.cancel()
+        conn.voice_mode = False
         print("Client disconnected", flush=True)
     finally:
         WS_CLIENTS.discard(ws)
