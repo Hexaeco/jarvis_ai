@@ -612,9 +612,12 @@ async function openView(name,path){
   // exactement, seule la plus haute dans le z-order etait cliquable).
   const n=Object.keys(openWindows).length;
   const offset=40*(n%6);
+  // x de base = 360 (colonne gauche 320px + marges du grid, verifie dans le CSS) pour ne pas
+  // ouvrir la fenetre par-dessus le panneau VIEWS lui-meme -- bug reel trouve : la fenetre
+  // par defaut recouvrait le bouton pour ouvrir la VIEWS suivante.
   openWindows[name]=new WinBox({
     title:name, url:base+path, class:["wb-alias"],
-    width:"60%", height:"70%", x:80+offset, y:80+offset,
+    width:"55%", height:"70%", x:360+offset, y:80+offset,
     onclose:()=>{ delete openWindows[name]; }
   });
 }
