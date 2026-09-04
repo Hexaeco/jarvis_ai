@@ -92,25 +92,11 @@ button.btn.amber{color:var(--amber); border-color:#7a5a1a; background:#241c0a}
 .appr pre{font-size:12px; color:#ffd98a; white-space:pre-wrap; word-break:break-all; max-height:90px; overflow-y:auto; margin-bottom:9px}
 .appr .row{display:flex; gap:10px}
 .msg.live{opacity:.65; font-style:italic}
-/* ---- pop-up viewer (kanban / dashboard) ---- */
-#viewer{position:fixed; inset:0; z-index:40; display:none; align-items:center; justify-content:center;
-  background:#02060cd9; backdrop-filter:blur(4px)}
-#viewer.open{display:flex}
-#viewerBox{width:90%; height:90%; position:relative; background:#050b14;
-  border:1px solid var(--cyan-dim); box-shadow:0 0 60px #00e5ff2e, inset 0 0 40px #00e5ff08;
-  animation:viewIn .32s cubic-bezier(.2,.9,.3,1.2);
-  clip-path:polygon(0 0,calc(100% - 22px) 0,100% 22px,100% 100%,22px 100%,0 calc(100% - 22px))}
-@keyframes viewIn{from{transform:scale(.88) translateY(20px);opacity:0}to{transform:none;opacity:1}}
-#viewerBar{display:flex; align-items:center; justify-content:space-between; height:40px;
-  padding:0 14px; border-bottom:1px solid var(--line); background:#081523}
-#viewerBar h3{font-family:'Orbitron'; font-size:12px; letter-spacing:4px; color:var(--cyan);
-  text-shadow:0 0 10px #00e5ff66}
-#viewerBar .vbtns{display:flex; gap:8px}
-#viewerIframe{width:100%; height:calc(100% - 40px); border:0; background:#0a1420}
-#viewerBox::before,#viewerBox::after{content:""; position:absolute; width:26px; height:26px;
-  border:2px solid var(--cyan); pointer-events:none}
-#viewerBox::before{top:-2px; left:-2px; border-right:none; border-bottom:none}
-#viewerBox::after{bottom:-2px; right:-2px; border-left:none; border-top:none}
+/* ---- VIEWS windows : WinBox.js (nextapps-de/winbox v0.2.82, vendored, pas de fenetre
+   maison) -- theme minimal pour rester coherent avec le reste du HUD, rien de plus. */
+.wb-alias .wb-header{background:#081523 !important; border-bottom:1px solid var(--line)}
+.wb-alias .wb-title{font-family:'Orbitron'; font-size:12px; letter-spacing:3px; color:var(--cyan) !important}
+.wb-alias .wb-body{background:#0a1420}
 .viewBtn{display:block; width:100%; text-align:left; margin-bottom:6px}
 
 /* ---------------- boot sequence ---------------- */
@@ -217,7 +203,6 @@ body.booted header{animation:panelIn .4s backwards}
   .col{order:2; overflow:visible; flex-shrink:0}
   .col:last-of-type{order:3}
   footer{order:4; flex-shrink:0; padding:6px 14px}
-  #viewerBox{width:97%; height:94%}
   #approvals{width:94%}
 }
 #activity{max-height:150px; overflow-y:auto; font-size:12.5px}
@@ -339,19 +324,6 @@ footer{
 
   <div id="holoStage"></div>
 
-  <div id="viewer">
-    <div id="viewerBox">
-      <div id="viewerBar">
-        <h3 id="viewerTitle">KANBAN</h3>
-        <div class="vbtns">
-          <button class="btn" id="viewerPop">OPEN TAB</button>
-          <button class="btn danger" id="viewerClose">✕ CLOSE</button>
-        </div>
-      </div>
-      <iframe id="viewerIframe" src="about:blank" title="view"></iframe>
-    </div>
-  </div>
-
   <footer>
     <span></span>
     <span id="footMsg">READY</span>
@@ -359,6 +331,7 @@ footer{
   </footer>
 </div>
 
+<script src="/hud/vendor/winbox.bundle.min.js"></script>
 <script>
 "use strict";
 /* ============================== state ============================== */
@@ -614,24 +587,35 @@ $("talkBtn").onclick=toggleTalk;
 $("reactorWrap").onclick=toggleTalk;
 $("stopBtn").onclick=stopRun;
 
-/* ---- pop-up viewer ---- */
-const DASH_PROXY=`https://${location.hostname}:9443`;
-function openView(name,path){
-  $("viewerTitle").textContent=name;
-  $("viewerIframe").src=DASH_PROXY+path;
-  $("viewer").classList.add("open");
+/* ---- VIEWS windows : WinBox.js reel (nextapps-de/winbox, vendored, v0.2.82) --
+   move/resize/minimize/maximize/restore/close natifs, plusieurs fenetres possibles a la fois.
+   Le port du dashboard_proxy est lu depuis la config serveur reelle via /api/hud-config
+   (bug reel corrige : etait code en dur a 9443, le port reel est 29443 -- fenetres vides). */
+let DASH_PROXY=null;
+const openWindows={};
+async function getDashProxy(){
+  if(DASH_PROXY)return DASH_PROXY;
+  try{
+    const r=await fetch("/api/hud-config"); const j=await r.json();
+    DASH_PROXY=`https://${location.hostname}:${j.dashboard_proxy_port}`;
+  }catch{
+    DASH_PROXY=`https://${location.hostname}:29443`;
+  }
+  return DASH_PROXY;
 }
-function closeView(){
-  $("viewer").classList.remove("open");
-  $("viewerIframe").src="about:blank";
+async function openView(name,path){
+  const existing=openWindows[name];
+  if(existing){ existing.focus(); return; }
+  const base=await getDashProxy();
+  openWindows[name]=new WinBox({
+    title:name, url:base+path, class:["wb-alias"],
+    width:"60%", height:"70%", x:"center", y:"center",
+    onclose:()=>{ delete openWindows[name]; }
+  });
 }
-$("viewerClose").onclick=closeView;
-$("viewerPop").onclick=()=>{window.open($("viewerIframe").src,"_blank");closeView()};
-$("viewer").addEventListener("click",e=>{if(e.target.id==="viewer")closeView()});
 addEventListener("keydown",e=>{
   if(e.key!=="Escape")return;
   if(document.querySelector(".holo:not(.dismiss)"))dismissAllPanels();
-  else if($("viewer").classList.contains("open"))closeView();
   else stopRun();
 });
 addEventListener("keydown",e=>{
