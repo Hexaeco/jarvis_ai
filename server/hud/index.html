@@ -363,7 +363,6 @@ footer{
 "use strict";
 /* ============================== state ============================== */
 const CONV = "alias-main";
-$("sessConv") && ($("sessConv").textContent = CONV);
 let ws=null, wsReady=false, capturing=false, state="standby";
 let audioCtx=null, workletNode=null, mediaStream=null, srcNode=null;
 let playhead=0, activeSources=[], leftoverByte=null, audioArrived=false;
