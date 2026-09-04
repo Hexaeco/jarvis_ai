@@ -698,18 +698,23 @@ async def api_auth_middleware(request: Request, call_next):
 
 
 def _ws_allowed(ws: WebSocket) -> bool:
-    """Browsers send Origin (+cookie); native clients (PTT, tests) send neither."""
+    """Browsers authenticate via the jarvis_token cookie; native clients via
+    Authorization: Bearer <token>. Origin is checked when present (browsers always send it)
+    but is never sufficient on its own -- the token is required in both cases. No query-string
+    token (would leak into proxy/access logs)."""
     origin = ws.headers.get("origin")
-    if not origin:
-        return True  # non-browser client on the LAN (Python PTT, e2e tests)
-    from urllib.parse import urlparse
-    host = (urlparse(origin).hostname or "").lower()
-    if host not in ALLOWED_ORIGIN_HOSTS:
-        return False
+    if origin:
+        from urllib.parse import urlparse
+        host = (urlparse(origin).hostname or "").lower()
+        if host not in ALLOWED_ORIGIN_HOSTS:
+            return False
     token = hud_token()
     if not token:
         return True
-    return ws.cookies.get("jarvis_token") == token or ws.query_params.get("token") == token
+    supplied_cookie = ws.cookies.get("jarvis_token")
+    auth_header = ws.headers.get("authorization") or ""
+    supplied_bearer = auth_header[7:] if auth_header.lower().startswith("bearer ") else None
+    return supplied_cookie == token or supplied_bearer == token
 
 
 # --------------------------------------------------------------- HUD + proxy
