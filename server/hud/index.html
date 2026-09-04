@@ -266,6 +266,7 @@ footer{
       <button class="btn viewBtn" onclick="openView('HERMES DASHBOARD','/')">▸ HERMES DASHBOARD</button>
       <button class="btn viewBtn" onclick="openView('CHAT','/chat')">▸ DASHBOARD CHAT</button>
       <button class="btn viewBtn" onclick="openView('CRON','/cron')">▸ JOBS/CRON</button>
+      <button class="btn viewBtn" onclick="openFiles()">▸ FILES</button>
     </div>
     <div class="panel"><h2><span>SESSION</span><span class="num">05</span></h2>
       <div class="kv"><span>Conversation</span><b id="sessConv">alias-main</b></div>
@@ -607,10 +608,18 @@ async function getDashProxy(){
   }
   return DASH_PROXY;
 }
-async function openView(name,path){
+async function openFiles(){
+  try{
+    const r=await fetch("/api/hud-config"); const j=await r.json();
+    const port=j.files_proxy_port;
+    if(!port){ console.error("files_proxy_port not configured"); return; }
+    await openView("FILES", null, `https://${location.hostname}:${port}/`);
+  }catch(e){ console.error("FILES open failed", e); }
+}
+async function openView(name,path,absoluteUrl){
   const existing=openWindows[name];
   if(existing){ existing.focus(); return; }
-  const base=await getDashProxy();
+  const url=absoluteUrl || (await getDashProxy())+path;
   // cascade : chaque nouvelle fenetre est decalee de la precedente au lieu de toutes s'empiler
   // au meme endroit (bug reel trouve : x/y="center" fixe pour toutes -> 4 fenetres superposees
   // exactement, seule la plus haute dans le z-order etait cliquable).
@@ -620,7 +629,7 @@ async function openView(name,path){
   // ouvrir la fenetre par-dessus le panneau VIEWS lui-meme -- bug reel trouve : la fenetre
   // par defaut recouvrait le bouton pour ouvrir la VIEWS suivante.
   openWindows[name]=new WinBox({
-    title:name, url:base+path, class:["wb-alias"],
+    title:name, url:url, class:["wb-alias"],
     width:"55%", height:"70%", x:360+offset, y:80+offset,
     onclose:()=>{ delete openWindows[name]; }
   });
