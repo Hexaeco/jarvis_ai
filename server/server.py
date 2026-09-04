@@ -1135,6 +1135,9 @@ async def files_http_proxy(path: str, request: Request) -> Response:
     body = await request.body()
     fwd_headers = {k: v for k, v in request.headers.items()
                    if k.lower() not in ("host", "accept-encoding", "connection")}
+    # jarvis_token deja verifie par files_auth_middleware ci-dessus : le header de confiance
+    # FileBrowser natif (auth.methods.proxy) est ajoute ici, jamais avant la verification.
+    fwd_headers["X-Alias-User"] = "admin"
 
     def do_request() -> requests.Response:
         return requests.request(
