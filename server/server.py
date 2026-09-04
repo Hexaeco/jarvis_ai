@@ -895,6 +895,21 @@ async def summon(request: Request) -> JSONResponse:
 _WORKER_CACHE: dict = {"ts": 0.0, "data": [], "refreshing": False}
 
 
+@app.get("/api/models-loadout")
+async def models_loadout() -> JSONResponse:
+    stt_cfg = CFG.get("stt") or {}
+    voice_cfg = CFG.get("voice") or {}
+    llm_cfg = CFG.get("llm") or {}
+    fallback_key_env = llm_cfg.get("api_key_env", "ANTHROPIC_API_KEY")
+    return JSONResponse({
+        "stt_model": stt_cfg.get("model", "?"),
+        "tts_model": voice_cfg.get("model", "?"),
+        "tts_configured": bool(os.environ.get("ELEVENLABS_API_KEY")),
+        "fallback_model": llm_cfg.get("model", "?"),
+        "fallback_configured": bool(os.environ.get(fallback_key_env)),
+    })
+
+
 @app.get("/api/machines")
 async def machines() -> JSONResponse:
     """Local (Mac) stats + configured remote workers.
@@ -903,7 +918,7 @@ async def machines() -> JSONResponse:
     background refresh; the endpoint always answers instantly from cache.
     """
     result: list[dict] = []
-    mac: dict = {"name": "MAC MINI · HERMES", "online": True}
+    mac: dict = {"name": "ALIAS VPS · HERMES", "online": True}
     if psutil:
         mac.update({
             "cpu": psutil.cpu_percent(interval=0.1),
