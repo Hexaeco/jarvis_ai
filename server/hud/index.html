@@ -473,7 +473,7 @@ function connect(){
     if(e.type==="summon_panel"){ summonPanel(e); }
     else if(e.type==="dismiss_panels"){ dismissAllPanels(); }
     else if(e.type==="partial_transcript"){ showLive(e.text); }
-    else if(e.type==="transcript"){ clearLive(); if(e.text)addMsg("you",e.text); }
+    else if(e.type==="transcript"){ clearLive(); if(e.text)addMsg("you",e.text); pendingTurnId=e.turn_id; firstAudioAcked=false; }
     else if(e.type==="run_started"){ currentRun=e.run_id; showStop(true); }
     else if(e.type==="approval_request"){ showApproval(e); }
     else if(e.type==="agent_status"){
@@ -533,8 +533,16 @@ function ensureCtx(){
   }
   if(audioCtx.state==="suspended")audioCtx.resume();
 }
+let pendingTurnId=null, firstAudioAcked=false;
 function playChunk(buf){
   ensureCtx();
+  if(!firstAudioAcked && pendingTurnId!=null){
+    firstAudioAcked=true;
+    // GO LATENCE : frontiere 8 (browser_first_audio). Aucun horodatage envoye --
+    // le serveur estampille sa propre horloge a la reception (voir handler
+    // "client_first_audio" cote serveur pour la justification).
+    if(wsReady)ws.send(JSON.stringify({type:"client_first_audio",turn_id:pendingTurnId}));
+  }
   let bytes=new Uint8Array(buf);
   if(leftoverByte!==null){const m=new Uint8Array(bytes.length+1);m[0]=leftoverByte;m.set(bytes,1);bytes=m;leftoverByte=null}
   if(bytes.length%2===1){leftoverByte=bytes[bytes.length-1];bytes=bytes.subarray(0,bytes.length-1)}
