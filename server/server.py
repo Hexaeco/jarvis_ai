@@ -22,9 +22,11 @@ and approval events. Falls back to direct Anthropic ("basic mode") if unreachabl
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -293,6 +295,42 @@ class HermesAPI:
 # ==================================================================== Pipeline
 
 
+# ------------------------------------------------------------------- TTS bridge
+# GO TTS uniquement (correction Master) : ElevenLabs interdit. Reutilise le
+# mecanisme text_to_speech natif de Hermes (Edge TTS, keyless) au lieu de
+# reimplementer un moteur TTS. Hermes tourne dans un conteneur Docker separe
+# (config/venv propres) donc le bridge minimal est un `docker exec` qui appelle
+# tools.tts_tool.text_to_speech_tool(provider="edge") tel quel, convertit le
+# MP3 resultant en PCM16 16kHz mono (deja le format attendu par playChunk() du
+# HUD) via ffmpeg (deja present dans le conteneur), puis supprime le fichier
+# audio temporaire -- aucun fichier audio public, transport interne uniquement.
+_HERMES_TTS_BRIDGE_SCRIPT = """
+import sys, os, json, base64, subprocess
+sys.path.insert(0, "/opt/hermes")
+text = base64.b64decode(os.environ["ALIAS_TTS_TEXT_B64"]).decode("utf-8")
+from tools.tts_tool import text_to_speech_tool
+result = json.loads(text_to_speech_tool(text=text, provider="edge"))
+if not result.get("success"):
+    sys.stderr.write(json.dumps(result))
+    sys.exit(1)
+file_path = result["file_path"]
+try:
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-i", file_path, "-f", "s16le", "-ar", "16000", "-ac", "1", "-"],
+        capture_output=True,
+    )
+finally:
+    try:
+        os.remove(file_path)
+    except OSError:
+        pass
+if proc.returncode != 0:
+    sys.stderr.write(proc.stderr.decode(errors="replace"))
+    sys.exit(1)
+sys.stdout.buffer.write(proc.stdout)
+"""
+
+
 class VoicePipelineServer:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -435,41 +473,31 @@ class VoicePipelineServer:
     # ------------------------------------------------------------------ TTS
 
     def tts_chunks_sync(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
-        voice = self.cfg["voice"]
-        key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY") or os.environ.get("XI_API_KEY")
-        if not key:
-            raise RuntimeError("ElevenLabs API key not found")
-        timing.tts_model = voice["model"]
-        timing.voice_id = voice["voice_id"]
+        """Bridge minimal vers le TTS natif Hermes (Edge TTS, keyless) --
+        aucun nouveau provider, aucune reimplementation : appelle le meme
+        tools.tts_tool.text_to_speech_tool que l'agent Hermes utilise deja."""
+        timing.tts_model = "hermes-edge"
+        timing.voice_id = "edge-default"
         timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
         record_usage(tts_chars=len(text))
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice['voice_id']}/stream"
-        params = {"output_format": voice.get("output_format", "pcm_16000")}
-        payload = {
-            "text": text,
-            "model_id": voice["model"],
-            "voice_settings": {
-                "stability": 0.55, "similarity_boost": 0.70,
-                "style": 0.10, "use_speaker_boost": True,
-            },
-        }
-        response = requests.post(
-            url, params=params,
-            headers={"xi-api-key": key, "Accept": "application/octet-stream", "Content-Type": "application/json"},
-            json=payload, stream=True, timeout=120,
+        text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        proc = subprocess.run(
+            ["docker", "exec", "-i",
+             "-e", f"ALIAS_TTS_TEXT_B64={text_b64}",
+             "alias-hermes", "/opt/hermes/.venv/bin/python3", "-"],
+            input=_HERMES_TTS_BRIDGE_SCRIPT.encode("utf-8"),
+            capture_output=True, timeout=60,
         )
-        if response.status_code >= 400:
-            response.close()
-            raise RuntimeError(f"ElevenLabs HTTP {response.status_code}: {response.text[:1000]}")
-        try:
-            for chunk in response.iter_content(chunk_size=4096):
-                if not chunk:
-                    continue
-                if timing.first_tts_audio_byte_monotonic is None:
-                    timing.first_tts_audio_byte_monotonic = time.perf_counter()
-                yield chunk
-        finally:
-            response.close()  # barge-in cancels mid-stream; don't leak the connection
+        if proc.returncode != 0:
+            raise RuntimeError(f"Hermes TTS bridge failed: {proc.stderr.decode(errors='replace')[:500]}")
+        pcm = proc.stdout
+        if not pcm:
+            raise RuntimeError("Hermes TTS bridge returned no audio")
+        chunk_size = 4096
+        for i in range(0, len(pcm), chunk_size):
+            if timing.first_tts_audio_byte_monotonic is None:
+                timing.first_tts_audio_byte_monotonic = time.perf_counter()
+            yield pcm[i:i + chunk_size]
 
     # ------------------------------------------------------------- Turn flow
 
@@ -801,12 +829,11 @@ async def hud_chat(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=502)
 
 
-_ELEVEN_CACHE: dict = {"ts": 0.0, "data": None}
 
 
 @app.get("/api/usage")
 async def usage() -> JSONResponse:
-    """LLM token usage (local tally) + ElevenLabs subscription quota."""
+    """LLM token usage (local tally). elevenlabs field kept null: TTS canonique = Hermes/Edge."""
     u = read_usage()
     cost_cfg = CFG.get("usage") or {}
     cin = float(cost_cfg.get("llm_cost_per_mtok_input", 0) or 0)
@@ -822,43 +849,11 @@ async def usage() -> JSONResponse:
             "today": u["today"], "total": u["total"],
             "today_cost": est(u["today"]), "total_cost": est(u["total"]),
         },
+        # ElevenLabs interdit (doctrine TTS) : plus jamais appele, meme si une
+        # cle trainait dans l'environnement. TTS canonique = Hermes/Edge (voir
+        # VoicePipelineServer.tts_chunks_sync), qui n'a pas de quota a afficher ici.
         "elevenlabs": None,
     }
-    # ElevenLabs subscription — NEVER blocks the response: serve the cache and
-    # refresh it in the background when stale.
-    now = time.time()
-    if (_ELEVEN_CACHE["data"] is None or now - _ELEVEN_CACHE["ts"] > 300) and not _ELEVEN_CACHE.get("refreshing"):
-        key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY") or os.environ.get("XI_API_KEY")
-        if key:
-            _ELEVEN_CACHE["refreshing"] = True
-
-            def fetch() -> dict | None:
-                try:
-                    r = requests.get("https://api.elevenlabs.io/v1/user/subscription",
-                                     headers={"xi-api-key": key}, timeout=10)
-                    if r.ok:
-                        j = r.json()
-                        return {
-                            "used": j.get("character_count"),
-                            "limit": j.get("character_limit"),
-                            "remaining": (j.get("character_limit") or 0) - (j.get("character_count") or 0),
-                            "tier": j.get("tier"),
-                            "resets_unix": j.get("next_character_count_reset_unix"),
-                        }
-                except Exception:
-                    pass
-                return None
-
-            async def refresh() -> None:
-                try:
-                    data = await asyncio.to_thread(fetch)
-                    if data is not None:
-                        _ELEVEN_CACHE.update(ts=time.time(), data=data)
-                finally:
-                    _ELEVEN_CACHE["refreshing"] = False
-
-            asyncio.get_running_loop().create_task(refresh())
-    out["elevenlabs"] = _ELEVEN_CACHE["data"]
     return JSONResponse(out)
 
 
