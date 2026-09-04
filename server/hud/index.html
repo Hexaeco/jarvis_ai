@@ -607,9 +607,14 @@ async function openView(name,path){
   const existing=openWindows[name];
   if(existing){ existing.focus(); return; }
   const base=await getDashProxy();
+  // cascade : chaque nouvelle fenetre est decalee de la precedente au lieu de toutes s'empiler
+  // au meme endroit (bug reel trouve : x/y="center" fixe pour toutes -> 4 fenetres superposees
+  // exactement, seule la plus haute dans le z-order etait cliquable).
+  const n=Object.keys(openWindows).length;
+  const offset=40*(n%6);
   openWindows[name]=new WinBox({
     title:name, url:base+path, class:["wb-alias"],
-    width:"60%", height:"70%", x:"center", y:"center",
+    width:"60%", height:"70%", x:80+offset, y:80+offset,
     onclose:()=>{ delete openWindows[name]; }
   });
 }
