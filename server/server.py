@@ -895,6 +895,29 @@ async def summon(request: Request) -> JSONResponse:
 _WORKER_CACHE: dict = {"ts": 0.0, "data": [], "refreshing": False}
 
 
+@app.get("/api/provider-balances")
+async def provider_balances() -> JSONResponse:
+    # Correction Master (COSTS) : soldes providers reels, lus depuis leurs API officielles avec
+    # les cles deja configurees. Aucune valeur statique. DeepSeek confirme en direct
+    # (GET https://api.deepseek.com/user/balance, documente, teste). GLM/Z.AI : aucune API de
+    # solde officielle trouvee -- reste None plutot qu'une valeur inventee.
+    out: dict = {"deepseek": None, "glm": None}
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY")
+    if deepseek_key:
+        try:
+            r = await asyncio.to_thread(
+                requests.get, "https://api.deepseek.com/user/balance",
+                headers={"Authorization": f"Bearer {deepseek_key}"}, timeout=8,
+            )
+            if r.ok:
+                infos = (r.json() or {}).get("balance_infos") or []
+                if infos:
+                    out["deepseek"] = {"balance": infos[0].get("total_balance"), "currency": infos[0].get("currency")}
+        except Exception:
+            pass
+    return JSONResponse(out)
+
+
 @app.get("/api/hud-config")
 async def hud_config() -> JSONResponse:
     # Correction Master (VIEWS) : le port du dashboard_proxy TLS peut changer d'un deploiement a
@@ -908,13 +931,35 @@ async def hud_config() -> JSONResponse:
 @app.get("/api/models-loadout")
 async def models_loadout() -> JSONResponse:
     stt_cfg = CFG.get("stt") or {}
-    voice_cfg = CFG.get("voice") or {}
     llm_cfg = CFG.get("llm") or {}
     fallback_key_env = llm_cfg.get("api_key_env", "ANTHROPIC_API_KEY")
+
+    # TTS : correction Master -- repart du TTS NATIF Hermes (deja valide historiquement), pas
+    # d'ElevenLabs. Interroge le vrai toolset Hermes (/v1/toolsets) au lieu de verifier une cle
+    # ElevenLabs qui n'est plus le TTS canonique. Moteur reel identifie par lecture directe du
+    # code Hermes (tools/tts_tool.py: DEFAULT_PROVIDER="edge", aucun override dans config.yaml)
+    # -- gratuit, sans cle, Microsoft Edge TTS.
+    tts_state = "?"
+    try:
+        r = await asyncio.to_thread(
+            requests.get, f"{HERMES.base}/v1/toolsets", headers=HERMES.headers(), timeout=8,
+        )
+        toolsets = r.json()
+        items = toolsets if isinstance(toolsets, list) else (toolsets.get("data") or toolsets.get("toolsets") or [])
+        tts_entry = next((t for t in items if t.get("name") == "tts"), None)
+        if tts_entry and tts_entry.get("enabled") and tts_entry.get("configured"):
+            tts_state = "Hermes native (edge)"
+        elif tts_entry and tts_entry.get("configured"):
+            tts_state = "Hermes native (edge) -- disabled for api_server"
+        else:
+            tts_state = "OFF / NOT CONFIGURED"
+    except Exception:
+        tts_state = "? (Hermes unreachable)"
+
     return JSONResponse({
         "stt_model": stt_cfg.get("model", "?"),
-        "tts_model": voice_cfg.get("model", "?"),
-        "tts_configured": bool(os.environ.get("ELEVENLABS_API_KEY")),
+        "tts_model": tts_state,
+        "tts_configured": tts_state.startswith("Hermes native") and "disabled" not in tts_state,
         "fallback_model": llm_cfg.get("model", "?"),
         "fallback_configured": bool(os.environ.get(fallback_key_env)),
     })
