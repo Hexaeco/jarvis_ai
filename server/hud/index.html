@@ -251,6 +251,9 @@ footer{
         <button class="btn" id="talkBtn" style="flex:1">ENGAGE VOICE</button>
         <button class="btn danger" id="stopBtn">■ STOP</button>
       </div>
+      <div style="margin-top:6px">
+        <button class="btn" id="voiceModeBtn" style="width:100%">ENTER VOICE MODE</button>
+      </div>
     </div>
     <div class="panel"><h2><span>AGENT ACTIVITY</span><span class="num">02</span></h2>
       <div id="activity"><div>— no activity yet —</div></div>
@@ -479,6 +482,10 @@ function connect(){
       else if(e.state==="speaking")setState("speaking","SPEAKING");
       else if(e.state==="stopped"){setState("standby","STANDBY");showStop(false);stopPlayback();addMsg("sys","run stopped")}
     }
+    else if(e.type==="voice_mode_status"){
+      if(e.state==="listening"){$("micState").textContent="LISTENING (auto)";setState("listening","VOICE MODE","SPEAK ANYTIME")}
+      else if(e.state==="stopped"){$("micState").textContent=voiceModeActive?"ready":"idle"}
+    }
     else if(e.type==="error"){ clearLive(); addMsg("sys","error: "+e.message); setState("standby","STANDBY"); showStop(false); }
     else if(e.type==="done"){
       currentRun=null; showStop(false);
@@ -488,11 +495,35 @@ function connect(){
       if(tm.total_turn_seconds!=null)$("mTotal").textContent=tm.total_turn_seconds+"s";
       $("mBrain").textContent=tm.llm_provider||"—";
       if(tm.response_text)addMsg("jarvis",tm.response_text);
-      setTimeout(()=>{if(state!=="listening")setState("standby","STANDBY")},400);
+      if(!voiceModeActive)setTimeout(()=>{if(state!=="listening")setState("standby","STANDBY")},400);
     }
   };
 }
 connect();
+
+/* ============================== voice mode (continu) ================ */
+let voiceModeActive=false;
+async function toggleVoiceMode(){
+  if(!wsReady){addMsg("sys","voice server offline");return}
+  if(voiceModeActive){
+    voiceModeActive=false;
+    capturing=false;
+    ws.send(JSON.stringify({type:"voice_mode_stop"}));
+    $("voiceModeBtn").textContent="ENTER VOICE MODE";
+    $("micDot").className="dot on"; $("micState").textContent="ready"; $("levelBar").style.width="0%";
+    setState("standby","STANDBY");
+    return;
+  }
+  try{await initMic()}catch(err){addMsg("sys","mic blocked: "+err.message);return}
+  stopPlayback();
+  voiceModeActive=true;
+  capturing=true;
+  ws.send(JSON.stringify({type:"voice_mode_start",conversation:CONV}));
+  $("voiceModeBtn").textContent="■ EXIT VOICE MODE";
+  $("micDot").className="dot on"; $("micState").textContent="LISTENING (auto)";
+  setState("listening","VOICE MODE","SPEAK ANYTIME");
+}
+$("voiceModeBtn").onclick=toggleVoiceMode;
 
 /* ============================== audio out ========================== */
 function ensureCtx(){
