@@ -895,6 +895,16 @@ async def summon(request: Request) -> JSONResponse:
 _WORKER_CACHE: dict = {"ts": 0.0, "data": [], "refreshing": False}
 
 
+@app.get("/api/hud-config")
+async def hud_config() -> JSONResponse:
+    # Correction Master (VIEWS) : le port du dashboard_proxy TLS peut changer d'un deploiement a
+    # l'autre (evite les collisions avec Caddy/autres instances) -- le HUD doit le lire depuis la
+    # config reelle plutot que de le coder en dur cote client (bug reel trouve : le JS visait
+    # :9443 alors que server.yaml configure 29443, fenetres VIEWS systematiquement vides).
+    port = ((CFG.get("server") or {}).get("dashboard_proxy") or {}).get("port")
+    return JSONResponse({"dashboard_proxy_port": port})
+
+
 @app.get("/api/models-loadout")
 async def models_loadout() -> JSONResponse:
     stt_cfg = CFG.get("stt") or {}
